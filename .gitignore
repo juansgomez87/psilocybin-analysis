@@ -3,6 +3,8 @@ assemble_data.py
 music2emo.py
 30s_mus2emo.py
 figs/
+interactive_visualizer.py
+interactive_psilocybin_visualizer.html
 
 MAEST/
 Music2Emotion/
