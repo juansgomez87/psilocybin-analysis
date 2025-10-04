@@ -51,6 +51,11 @@ python assemble_data.py
 python classifier.py -clf [phase/playlist] -algo compare_lld -mean [y/n] -reg [log/rf]
 ```
 
+3. Run unsupervised learning script to obtain clusters and evaluation. 
+```
+python cluster.py -label [phase/playlist] -algo compare_lld -mean [y/n] -method [kmeans/gmm/agglomerative]
+```
+
 4. Run stats script to obtain statistics on features. We do this only on features every 30s.
 ```
 python stats.py -algo compare_lld
