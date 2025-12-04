@@ -14,10 +14,11 @@ from sklearn.preprocessing import label_binarize
 from sklearn.decomposition import PCA
 from sklearn.exceptions import ConvergenceWarning
 from collections import Counter
-from statsmodels.stats.contingency_tables import mcnemar
+from scipy.stats import ttest_rel
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import RandomUnderSampler
 import shap
+import random
 
 import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -30,8 +31,11 @@ warnings.filterwarnings('ignore', message='invalid value encountered in divide')
 import pdb
 
 class PsiloClassifier():
-    def __init__(self, clf, algo, mean, cv, plot_flag, playlist, reg, resample_method=None):
+    def __init__(self, clf, algo, mean, cv, plot_flag, playlist, reg, resample_method=None, clip=False, boundaries=False, do_pca=False):
         self.seed = 1987
+        np.random.seed(self.seed)
+        random.seed(self.seed)
+        self.do_pca = do_pca
         self.clf = clf
         self.algo = algo
         self.df = pd.read_csv(f'data/df_{algo}{mean}.csv', index_col=0)
@@ -39,7 +43,69 @@ class PsiloClassifier():
         self.playlist = playlist
         self.reg = reg  # log - logistic regression, rf - random forest
         self.resample_method = resample_method
-        
+        self.clip = clip
+        self.boundaries = boundaries
+
+        if self.clf == 'phase' and self.boundaries:
+            # always find songs at the boundaries of each phase for whole songs
+            temp = pd.read_csv(f'data/df_{algo}_mean.csv', index_col=0)
+            temp = temp.reset_index(drop=True)
+            # from onset to peak
+            boundaries_onset_peak = [(i, i+1) for i in range(len(temp) - 1) if temp.loc[i, 'phase'] == 'onset' and temp.loc[i+1, 'phase'] == 'peak']
+            # flatten the list of tuples
+            boundaries_onset_peak = [i for t in boundaries_onset_peak for i in t]
+            # from peak to return
+            boundaries_peak_return = [(i, i+1) for i in range(len(temp) - 1) if temp.loc[i, 'phase'] == 'peak' and temp.loc[i+1, 'phase'] == 'return']
+            # flatten the list of tuples
+            boundaries_peak_return = [i for t in boundaries_peak_return for i in t]
+            # get the index of the songs at the boundaries
+            boundaries_idx = boundaries_onset_peak + boundaries_peak_return
+            # get spotify ids 
+            spotify_ids = temp.loc[boundaries_idx, 'spotify_id'].values
+            # drop all rows with that spotify id
+            initial_len = len(self.df)
+            self.df = self.df[~self.df['spotify_id'].isin(spotify_ids)]
+            removed_len = initial_len - len(self.df)
+            if mean:
+                print(f'Removing {removed_len} songs at the boundaries of each phase for whole songs!')
+            else:
+                print(f'Removing {removed_len} chunks at the boundaries of each phase for chunks!')
+
+
+        if self.clf == 'phase' and self.clip:
+            print('Clipping the data of return phase!')
+            # use full data to get durations and clip the return phase
+            temp = pd.read_csv(f'data/full_data.csv', index_col=0)
+            temp = temp[temp['process?'] == True].copy()
+
+            return_durations = [(_, temp[(temp.playlist == _) & (temp.phase == 'return')]['Duration (m)'].sum()) for _ in temp['playlist'].unique()]
+            shortest = min(return_durations, key=lambda x: x[1])
+            # ('imperial2', np.float64(126.983))
+            print(f'Shortest return phase is {shortest[0]} with duration {shortest[1]} minutes!')
+            # clip the return phase of all other playlists to the duration of the shortest return phase
+            spotify_ids = []
+            for playlist in temp['playlist'].unique():
+                if playlist != shortest[0]:
+                    df_playlist = temp[temp['playlist'] == playlist]
+                    df_playlist = df_playlist[df_playlist['phase'] == 'return']
+                    df_playlist = df_playlist.reset_index(drop=True)                    
+                    # Calculate cumulative sum of durations
+                    df_playlist['cumulative_duration'] = df_playlist['Duration (m)'].cumsum()
+                    
+                    # Find rows that need to be dropped (those that exceed the threshold)
+                    rows_to_drop = df_playlist[df_playlist['cumulative_duration'] > shortest[1]]
+                    ids = rows_to_drop['link'].str.extract(r'track/([a-zA-Z0-9]+)')[0].tolist()
+                    spotify_ids.extend(ids)
+                    # print(f'Playlist {playlist}: Dropping {len(ids)} songs with Spotify IDs: {ids}')
+
+            initial_len = len(self.df)
+            self.df = self.df[~self.df['spotify_id'].isin(spotify_ids)]
+            removed_len = initial_len - len(self.df)
+            if mean:
+                print(f'Removing {removed_len} songs by clipping return phase!')
+            else:
+                print(f'Removing {removed_len} chunks by clipping return phase!')
+                    
         if playlist == 'all':
             print('Using all playlists!')
             all_playlists = self.df['playlist'].unique().tolist()
@@ -60,7 +126,6 @@ class PsiloClassifier():
                            ['file', 'chunk', 'phase', 'playlist', 'umap_x', 'umap_y', 'artist', 'song', 'spotify_id']]
         
 
-        print('Doing PCA reduction!')
         self.pca_reduction()
 
         self.y = self.df[clf].values 
@@ -70,12 +135,13 @@ class PsiloClassifier():
         if self.reg == 'log':
             self.model = LogisticRegression(
                 max_iter=2000,
-                solver='lbfgs'
+                solver='lbfgs',
+                random_state=self.seed
             )
         elif self.reg == 'rf':
             self.model = RandomForestClassifier(
                 n_estimators=100,
-                max_depth=None,  # or set to limit complexity
+                max_depth=None,  
                 random_state=self.seed,
                 n_jobs=-1
             )
@@ -83,21 +149,23 @@ class PsiloClassifier():
         self.run_classification()
         
     def pca_reduction(self):
-        print('Calculating PCA, this might take time...')
+        
         self.X = self.df[self.feature_columns].values
         scaler = StandardScaler()
         self.X = scaler.fit_transform(self.X)
     
-        pca = PCA(n_components=0.99)
-        X_pca = pca.fit_transform(self.X)
-        n_comp = X_pca.shape[1]
-        print('-'*50)
-        print(f'PCA reduced from {len(self.feature_columns)} to {n_comp} to keep 99% of variance!')
+        if self.do_pca:
+            print('Calculating PCA, this might take time...')
+            pca = PCA(n_components=0.99)
+            X_pca = pca.fit_transform(self.X)
+            n_comp = X_pca.shape[1]
+            print('-'*50)
+            print(f'PCA reduced from {len(self.feature_columns)} to {n_comp} to keep 99% of variance!')
 
-        self.feature_columns = [f'pca_{i}' for i in range(X_pca.shape[1])]
-        df_pca = pd.DataFrame(X_pca, columns=self.feature_columns, index=self.df.index)
-        self.df = pd.concat([self.df, df_pca], axis=1)
-        self.X = self.df[self.feature_columns].values
+            self.feature_columns = [f'pca_{i}' for i in range(X_pca.shape[1])]
+            df_pca = pd.DataFrame(X_pca, columns=self.feature_columns, index=self.df.index)
+            self.df = pd.concat([self.df, df_pca], axis=1)
+            self.X = self.df[self.feature_columns].values
 
     def _resample_fold(self, X_train, y_train):
         """Apply resampling to a single fold's training data and calculate class weights."""
@@ -127,6 +195,8 @@ class PsiloClassifier():
         
         y_true_all, y_pred_all, y_score_all = [], [], []
         
+        model_accs_per_fold = []
+        baseline_accs_per_fold = []
         for train_idx, test_idx in skf.split(self.X, self.y, groups=self.df['file'].values):
             X_train, X_test = self.X[train_idx], self.X[test_idx]
             y_train, y_test = self.y[train_idx], self.y[test_idx]
@@ -157,7 +227,15 @@ class PsiloClassifier():
             
             self.model.fit(X_train, y_train)
             y_pred = self.model.predict(X_test)
+            model_acc = accuracy_score(y_test, y_pred)
+            model_accs_per_fold.append(model_acc)
             y_score = self.model.predict_proba(X_test)
+            
+            # Calculate baseline accuracy per fold (majority class from training data)
+            majority_class = Counter(y_train).most_common(1)[0][0]
+            y_baseline_pred = np.full_like(y_test, majority_class)
+            baseline_acc = accuracy_score(y_test, y_baseline_pred)
+            baseline_accs_per_fold.append(baseline_acc)
             
             y_true_all.extend(y_test)
             y_pred_all.extend(y_pred)
@@ -171,7 +249,7 @@ class PsiloClassifier():
         # self.evaluate(y_true_all, y_pred_all, y_score_all)
         self.plot_stratified_splits()
         self.plot_roc_auc(y_true_all, y_score_all, self.model.classes_)
-        self.compare_with_chance(y_true_all, y_pred_all)
+        self.compare_with_chance(y_true_all, y_pred_all, model_accs_per_fold, baseline_accs_per_fold)
         self.feature_importance()
         if self.plot_flag:
             self.explain_with_shap()
@@ -235,10 +313,10 @@ class PsiloClassifier():
         plt.show()
 
 
-    def compare_with_chance(self, y_true, y_pred):
+    def compare_with_chance(self, y_true, y_pred, model_accs_per_fold=None, baseline_accs_per_fold=None):
         cm = confusion_matrix(y_true, y_pred, labels=self.model.classes_)
         cm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
-        cm = np.round(cm, 1)
+        cm = np.round(cm, 2)
 
         print('-'*50)
         print('Confusion Matrix:')
@@ -293,20 +371,45 @@ class PsiloClassifier():
         # print("Baseline (Chance) Classification Report:")
         # print(classification_report(y_true, y_chance_pred))
 
-        # Perform McNemar’s test
-        contingency_table = np.array([
-            [(y_true == y_pred).sum(), (y_true != y_pred).sum()],
-            [(y_true == y_chance_pred).sum(), (y_true != y_chance_pred).sum()]
-        ])
-        result = mcnemar(contingency_table, exact=True)
-        print(f"\nMcNemar’s test p-value: {result.pvalue:.7f}")
+        # Perform paired t-test with cross-validation
+        if model_accs_per_fold is not None and baseline_accs_per_fold is not None:
+            # Convert to numpy arrays for easier computation
+            model_accs = np.array(model_accs_per_fold)
+            baseline_accs = np.array(baseline_accs_per_fold)
+            
+            # Perform paired t-test
+            t_stat, p_value = ttest_rel(model_accs, baseline_accs)
+            
+            print(f"\nPaired t-test (cross-validation):")
+            print(f"  Model mean accuracy across folds: {model_accs.mean():.3f} ± {model_accs.std():.3f}")
+            print(f"  Baseline mean accuracy across folds: {baseline_accs.mean():.3f} ± {baseline_accs.std():.3f}")
+            print(f"  t-statistic: {t_stat:.3f}")
+            if p_value < 0.001:
+                sig_marker = "***"
+            elif p_value < 0.01:
+                sig_marker = "**"
+            elif p_value < 0.05:
+                sig_marker = "*"
+            else:
+                sig_marker = ""
+            
+            print(f"  p-value: {p_value:.7f}{sig_marker}")
 
-        if result.pvalue < 0.05 and model_acc > chance_acc:
-            print("The classifier is significantly better than chance! 🎉")
-        elif result.pvalue < 0.05 and model_acc < chance_acc:
-            print("The classifier is significantly worse than chance. 😡")
+            if p_value < 0.05 and model_accs.mean() > baseline_accs.mean():
+                print("The classifier is significantly better than chance! 🎉")
+            elif p_value < 0.05 and model_accs.mean() < baseline_accs.mean():
+                print("The classifier is significantly worse than chance. 😡")
+            else:
+                print("The classifier is NOT significantly better than chance. 🤔")
         else:
-            print("The classifier is NOT significantly better than chance. 🤔")
+            # Fallback: use overall accuracy comparison (no statistical test)
+            print(f"\nNote: Per-fold accuracies not provided. Cannot perform paired t-test.")
+            if model_acc > chance_acc:
+                print("The classifier has higher accuracy than chance baseline.")
+            elif model_acc < chance_acc:
+                print("The classifier has lower accuracy than chance baseline.")
+            else:
+                print("The classifier has the same accuracy as chance baseline.")
             
     def feature_importance(self, top_n=5):
         if not hasattr(self.model, "coef_"):
@@ -331,10 +434,9 @@ class PsiloClassifier():
             plt.show()
 
         else:
-            # Multiclass classification in subplots
             if self.plot_flag:
                 n_classes = coefs.shape[0]
-                fig, axes = plt.subplots(nrows=n_classes, figsize=(10, 2 * n_classes), sharex=True)
+                fig, axes = plt.subplots(nrows=n_classes, figsize=(8, 1.5 * n_classes), sharex=True)
 
                 if n_classes == 1:
                     axes = [axes]
@@ -354,7 +456,8 @@ class PsiloClassifier():
                         ax=axes[i],
                         # palette="coolwarm",
                     )
-                    axes[i].set_title(f"Feature Importances for class '{class_label}'")
+                    axes[i].set_ylabel("")
+                    axes[i].set_title(f"Feature Importance for '{class_label}'")
 
                 plt.tight_layout()
                 plt.savefig(f'figs/{args.clf}_{self.algo}_{self.reg}_feats_importance.pdf')
@@ -365,9 +468,8 @@ class PsiloClassifier():
 
         print("Generating SHAP explanations...")
 
-        # Use LinearExplainer for multiclass model
         explainer = shap.Explainer(self.model, self.X, feature_names=self.feature_columns)
-        shap_values = explainer(self.X)  # This is a list of SHAP values, one array per class
+        shap_values = explainer(self.X) 
         if isinstance(shap_values, list) or len(shap_values.shape) == 3:
             # Multiclass case: loop through classes
             n_classes = len(self.model.classes_)
@@ -384,17 +486,19 @@ class PsiloClassifier():
                         max_display=5,
                         show=False,
                         alpha=0.5,
-                        plot_size=(6, 6)
+                        plot_size=(8, 6),
+                        color_bar=False  # Disable colorbar (right y-axis)
                         # plot_size=(6, 4.5)
                     )
-                    ax.set_xlabel("")
+                    ax.set_xlabel(f"SHAP values for '{class_label}'", fontsize=10)
         
-                    ax.set_title(f"SHAP values for '{class_label}'", fontsize=10)
+                    # ax.set_title(f"SHAP values for '{class_label}'", fontsize=10)
                     for label in ax.get_yticklabels():
-                        label.set_fontsize(8)  
+                        label.set_fontsize(10)  
 
                     for label in ax.get_xticklabels():
-                        label.set_fontsize(8)  # Set your preferred fontsize here
+                        label.set_fontsize(10)  # Set your preferred fontsize here
+
 
                 plt.tight_layout()
                 plt.savefig(f'figs/{args.clf}_{self.algo}_{self.reg}_shap.pdf')
@@ -417,12 +521,17 @@ if __name__ == "__main__":
                         type=str,
                         choices=['log', 'rf'],
                         default='log',
-                        help='Select the regression model to use.')
+                        help='Select the classification model to use.')
     parser.add_argument('-mean', 
                         dest='mean',
                         action='store_true',
                         default=False,
-                        help='Select mean (song-level) features for classification.')
+                        help='Select mean (song-level) features for classification.')    
+    parser.add_argument('-pca', 
+                        dest='pca',
+                        action='store_false',
+                        default=True,
+                        help='Select to NOT perform PCA reduction.')
     parser.add_argument('-cv', 
                         type=int,
                         choices=[5, 10],
@@ -444,7 +553,21 @@ if __name__ == "__main__":
                         choices=['smote', 'under'],
                         default=None,
                         help='Apply resampling to handle class imbalance: smote (oversample minority) or undersample (undersample majority).')
+    parser.add_argument('-clip', 
+                        dest='clip',
+                        action='store_true',
+                        default=False,
+                        help='Clip the data of return phase.')
+    parser.add_argument('-boundaries', 
+                        dest='boundaries',
+                        action='store_true',
+                        default=False,
+                        help='Remove ')                        
     args = parser.parse_args()
+
+    if args.boundaries and args.clip:
+        print('Cannot clip and remove boundaries at the same time!')
+        exit()
 
     mean_str = '_mean' if args.mean else ''
 
@@ -455,4 +578,7 @@ if __name__ == "__main__":
                           plot_flag=args.plot, 
                           playlist=args.playlist, 
                           reg=args.reg,
-                          resample_method=args.resample)   
+                          resample_method=args.resample,
+                          clip=args.clip,
+                          boundaries=args.boundaries,
+                          do_pca=args.pca)   

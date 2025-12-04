@@ -14,7 +14,7 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.preprocessing import label_binarize
 import matplotlib.pyplot as plt
 from collections import Counter
-from statsmodels.stats.contingency_tables import mcnemar
+from scipy.stats import ttest_rel
 
 import pdb
 
@@ -27,7 +27,6 @@ def classify(df, clf, cv):
                         'Start Time', 'Phase']]
     print(f'Using {feature_columns} for classification!')
 
-    # Split into numeric and categorical
     numeric_cols = df[feature_columns].select_dtypes(include=['float64', 'int64']).columns.tolist()
     categorical_cols = df[feature_columns].select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
     print(f'Numeric features {numeric_cols} for classification!')
@@ -43,7 +42,6 @@ def classify(df, clf, cv):
     )
     class_weight_dict = dict(zip(np.unique(y), class_weights))
 
-    # Preprocessor
     preprocessor = ColumnTransformer(
         transformers=[
             ('num', StandardScaler(), numeric_cols),
@@ -51,7 +49,6 @@ def classify(df, clf, cv):
         ]
     )
 
-    # Model pipeline
     model = Pipeline(steps=[
         ('preprocess', preprocessor),
         ('clf', LogisticRegression(max_iter=2000, solver='lbfgs', class_weight=class_weight_dict))
@@ -60,6 +57,8 @@ def classify(df, clf, cv):
     skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
     
     y_true_all, y_pred_all, y_score_all = [], [], []
+    model_accs_per_fold = []
+    baseline_accs_per_fold = []
 
     for train_idx, test_idx in skf.split(X, y):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
@@ -67,19 +66,25 @@ def classify(df, clf, cv):
 
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
+        model_acc = accuracy_score(y_test, y_pred)
+        model_accs_per_fold.append(model_acc)
         y_score = model.predict_proba(X_test)
+
+        majority_class = Counter(y_train).most_common(1)[0][0]
+        y_baseline_pred = np.full_like(y_test, majority_class)
+        baseline_acc = accuracy_score(y_test, y_baseline_pred)
+        baseline_accs_per_fold.append(baseline_acc)
 
         y_true_all.extend(y_test)
         y_pred_all.extend(y_pred)
         y_score_all.extend(y_score)
 
-    # Convert lists to numpy arrays
     y_true_all = np.array(y_true_all)
     y_pred_all = np.array(y_pred_all)
     y_score_all = np.array(y_score_all)
 
     plot_roc_auc(y_true_all, y_score_all)
-    compare_with_chance(model, y_true_all, y_pred_all)
+    compare_with_chance(model, y_true_all, y_pred_all, model_accs_per_fold, baseline_accs_per_fold)
 
 
 def plot_roc_auc(y_true, y_score):
@@ -100,7 +105,7 @@ def plot_roc_auc(y_true, y_score):
     plt.show()
     
 
-def compare_with_chance(model, y_true, y_pred):
+def compare_with_chance(model, y_true, y_pred, model_accs_per_fold=None, baseline_accs_per_fold=None):
     cm = confusion_matrix(y_true, y_pred, labels=model.classes_)
     cm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
     cm = np.round(cm, 1)
@@ -122,20 +127,15 @@ def compare_with_chance(model, y_true, y_pred):
             text = disp.text_[i, j]
             text.set_fontsize(6)
             if i == j:
-                text.set_weight('bold')  # bold diagonal
-                # text.set_color('black') 
-    # for text in disp.text_.ravel():
-    #     text.set_fontsize(4)
+                text.set_weight('bold')  
 
     ax.tick_params(axis='both', which='major', labelsize=8)
 
     plt.tight_layout()
     plt.show()
-    # Majority class baseline
     majority_class = Counter(y_true).most_common(1)[0][0]
     y_chance_pred = np.full_like(y_true, majority_class)
 
-    # Compute accuracy
     model_acc = accuracy_score(y_true, y_pred)
     chance_acc = accuracy_score(y_true, y_chance_pred)
 
@@ -148,20 +148,44 @@ def compare_with_chance(model, y_true, y_pred):
     # print("Baseline (Chance) Classification Report:")
     # print(classification_report(y_true, y_chance_pred))
 
-    # Perform McNemar’s test
-    contingency_table = np.array([
-        [(y_true == y_pred).sum(), (y_true != y_pred).sum()],
-        [(y_true == y_chance_pred).sum(), (y_true != y_chance_pred).sum()]
-    ])
-    result = mcnemar(contingency_table, exact=True)
-    print(f"\nMcNemar’s test p-value: {result.pvalue:.7f}")
+    # Perform paired t-test with cross-validation
+    if model_accs_per_fold is not None and baseline_accs_per_fold is not None:
+        # Convert to numpy arrays for easier computation
+        model_accs = np.array(model_accs_per_fold)
+        baseline_accs = np.array(baseline_accs_per_fold)
+        
+        # Perform paired t-test
+        t_stat, p_value = ttest_rel(model_accs, baseline_accs)
+        
+        print(f"\nPaired t-test (cross-validation):")
+        print(f"  Model mean accuracy across folds: {model_accs.mean():.3f} ± {model_accs.std():.3f}")
+        print(f"  Baseline mean accuracy across folds: {baseline_accs.mean():.3f} ± {baseline_accs.std():.3f}")
+        print(f"  t-statistic: {t_stat:.3f}")
+        if p_value < 0.001:
+            sig_marker = "***"
+        elif p_value < 0.01:
+            sig_marker = "**"
+        elif p_value < 0.05:
+            sig_marker = "*"
+        else:
+            sig_marker = ""
+        
+        print(f"  p-value: {p_value:.7f}{sig_marker}")
 
-    if result.pvalue < 0.05 and model_acc > chance_acc:
-        print("The classifier is significantly better than chance! 🎉")
-    elif result.pvalue < 0.05 and model_acc < chance_acc:
-        print("The classifier is significantly worse than chance. 😡")
+        if p_value < 0.05 and model_accs.mean() > baseline_accs.mean():
+            print("The classifier is significantly better than chance! 🎉")
+        elif p_value < 0.05 and model_accs.mean() < baseline_accs.mean():
+            print("The classifier is significantly worse than chance. 😡")
+        else:
+            print("The classifier is NOT significantly better than chance. 🤔")
     else:
-        print("The classifier is NOT significantly better than chance. 🤔")
+        print(f"\nNote: Per-fold accuracies not provided. Cannot perform paired t-test.")
+        if model_acc > chance_acc:
+            print("The classifier has higher accuracy than chance baseline.")
+        elif model_acc < chance_acc:
+            print("The classifier has lower accuracy than chance baseline.")
+        else:
+            print("The classifier has the same accuracy as chance baseline.")
 
 
 

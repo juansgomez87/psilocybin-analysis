@@ -12,6 +12,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.exceptions import ConvergenceWarning
 from collections import Counter
+import random
 import warnings
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -24,8 +25,11 @@ warnings.filterwarnings('ignore', message='invalid value encountered in divide')
 import pdb
 
 class PsiloClusterer():
-    def __init__(self, algo, mean, clustering_method, plot_flag, playlist, label_type):
+    def __init__(self, algo, mean, clustering_method, plot_flag, playlist, label_type, clip=False, boundaries=False):
         self.seed = 1987
+        # Set random seeds for reproducibility
+        np.random.seed(self.seed)
+        random.seed(self.seed)
         self.clustering_method = clustering_method
         self.label_type = label_type
 
@@ -33,6 +37,69 @@ class PsiloClusterer():
         self.df = pd.read_csv(f'data/df_{algo}{mean}.csv', index_col=0)
         self.plot_flag = plot_flag
         self.playlist = playlist
+        self.clip = clip
+        self.boundaries = boundaries
+
+
+        if self.label_type == 'phase' and self.boundaries:
+            # always find songs at the boundaries of each phase for whole songs
+            temp = pd.read_csv(f'data/df_{algo}_mean.csv', index_col=0)
+            temp = temp.reset_index(drop=True)
+            # from onset to peak
+            boundaries_onset_peak = [(i, i+1) for i in range(len(temp) - 1) if temp.loc[i, 'phase'] == 'onset' and temp.loc[i+1, 'phase'] == 'peak']
+            # flatten the list of tuples
+            boundaries_onset_peak = [i for t in boundaries_onset_peak for i in t]
+            # from peak to return
+            boundaries_peak_return = [(i, i+1) for i in range(len(temp) - 1) if temp.loc[i, 'phase'] == 'peak' and temp.loc[i+1, 'phase'] == 'return']
+            # flatten the list of tuples
+            boundaries_peak_return = [i for t in boundaries_peak_return for i in t]
+            # get the index of the songs at the boundaries
+            boundaries_idx = boundaries_onset_peak + boundaries_peak_return
+            # get spotify ids 
+            spotify_ids = temp.loc[boundaries_idx, 'spotify_id'].values
+            # drop all rows with that spotify id
+            initial_len = len(self.df)
+            self.df = self.df[~self.df['spotify_id'].isin(spotify_ids)]
+            removed_len = initial_len - len(self.df)
+            if mean:
+                print(f'Removing {removed_len} songs at the boundaries of each phase for whole songs!')
+            else:
+                print(f'Removing {removed_len} chunks at the boundaries of each phase for chunks!')
+
+
+        if self.label_type == 'phase' and self.clip:
+            print('Clipping the data of return phase!')
+            # use full data to get durations and clip the return phase
+            temp = pd.read_csv(f'data/full_data.csv', index_col=0)
+            temp = temp[temp['process?'] == True].copy()
+
+            return_durations = [(_, temp[(temp.playlist == _) & (temp.phase == 'return')]['Duration (m)'].sum()) for _ in temp['playlist'].unique()]
+            shortest = min(return_durations, key=lambda x: x[1])
+            # ('imperial2', np.float64(126.983))
+            print(f'Shortest return phase is {shortest[0]} with duration {shortest[1]} minutes!')
+            # clip the return phase of all other playlists to the duration of the shortest return phase
+            spotify_ids = []
+            for playlist in temp['playlist'].unique():
+                if playlist != shortest[0]:
+                    df_playlist = temp[temp['playlist'] == playlist]
+                    df_playlist = df_playlist[df_playlist['phase'] == 'return']
+                    df_playlist = df_playlist.reset_index(drop=True)                    
+                    # Calculate cumulative sum of durations
+                    df_playlist['cumulative_duration'] = df_playlist['Duration (m)'].cumsum()
+                    
+                    # Find rows that need to be dropped (those that exceed the threshold)
+                    rows_to_drop = df_playlist[df_playlist['cumulative_duration'] > shortest[1]]
+                    ids = rows_to_drop['link'].str.extract(r'track/([a-zA-Z0-9]+)')[0].tolist()
+                    spotify_ids.extend(ids)
+                    # print(f'Playlist {playlist}: Dropping {len(ids)} songs with Spotify IDs: {ids}')
+
+            initial_len = len(self.df)
+            self.df = self.df[~self.df['spotify_id'].isin(spotify_ids)]
+            removed_len = initial_len - len(self.df)
+            if mean:
+                print(f'Removing {removed_len} songs by clipping return phase!')
+            else:
+                print(f'Removing {removed_len} chunks by clipping return phase!')
 
         if playlist == 'all':
             print('Using all playlists!')
@@ -47,7 +114,7 @@ class PsiloClusterer():
             self.df = self.df[self.df['playlist'] == playlist]
             print(f'Using only {playlist} playlist!')
 
-        # Define feature and label columns
+        # Define -and label columns
         self.feature_columns = [col for col in self.df.columns if col not in 
                            ['file', 'chunk', 'phase', 'playlist', 'umap_x', 'umap_y', 'artist', 'song', 'spotify_id']]
         
@@ -182,38 +249,28 @@ class PsiloClusterer():
         """Align cluster labels to minimize confusion matrix off-diagonal elements."""
         from scipy.optimize import linear_sum_assignment
         
-        # Convert labels to numeric for confusion matrix computation
         unique_true_labels = np.unique(self.y_true)
         unique_pred_labels = np.unique(self.y_pred)
         
-        # Create label encoders
         true_label_to_num = {label: i for i, label in enumerate(unique_true_labels)}
         pred_label_to_num = {label: i for i, label in enumerate(unique_pred_labels)}
         
-        # Convert to numeric
         y_true_num = np.array([true_label_to_num[label] for label in self.y_true])
         y_pred_num = np.array([pred_label_to_num[label] for label in self.y_pred])
         
-        # Create confusion matrix with numeric labels
         cm = confusion_matrix(y_true_num, y_pred_num)
         
-        # Use Hungarian algorithm to find optimal assignment
-        # We want to maximize the sum of diagonal elements
-        # So we negate the matrix for minimization
         cost_matrix = -cm
         row_indices, col_indices = linear_sum_assignment(cost_matrix)
         
-        # Create mapping from predicted cluster to true label
         cluster_mapping = {}
         for true_idx, pred_idx in zip(row_indices, col_indices):
             pred_label = unique_pred_labels[pred_idx]
             true_label = unique_true_labels[true_idx]
             cluster_mapping[pred_label] = true_label
         
-        # Apply mapping to get aligned predictions (using true label names)
         y_pred_aligned = np.array([cluster_mapping.get(pred, pred) for pred in self.y_pred])
         
-        # Recompute confusion matrix with aligned labels
         cm_aligned = confusion_matrix(self.y_true, y_pred_aligned)
         
         return cm_aligned, [cluster_mapping.get(unique_pred_labels[i], unique_pred_labels[i]) for i in range(len(unique_pred_labels))]
@@ -222,40 +279,29 @@ class PsiloClusterer():
         """Show which predicted cluster corresponds to which true class."""
         from scipy.optimize import linear_sum_assignment
         
-        # Convert labels to numeric for confusion matrix computation
         unique_true_labels = np.unique(self.y_true)
         unique_pred_labels = np.unique(self.y_pred)
         
-        # Create label encoders
         true_label_to_num = {label: i for i, label in enumerate(unique_true_labels)}
         pred_label_to_num = {label: i for i, label in enumerate(unique_pred_labels)}
         
-        # Convert to numeric
         y_true_num = np.array([true_label_to_num[label] for label in self.y_true])
         y_pred_num = np.array([pred_label_to_num[label] for label in self.y_pred])
         
-        # Create confusion matrix with numeric labels
         cm = confusion_matrix(y_true_num, y_pred_num)
         
-        # Use Hungarian algorithm to find optimal assignment
         cost_matrix = -cm
         row_indices, col_indices = linear_sum_assignment(cost_matrix)
         
-        # Create mapping from predicted cluster to true label
         cluster_mapping = {}
         for true_idx, pred_idx in zip(row_indices, col_indices):
             pred_label = unique_pred_labels[pred_idx]
             true_label = unique_true_labels[true_idx]
             cluster_mapping[pred_label] = true_label
         
-        # Show the mapping
-        # print('  Predicted Cluster → True Class:')
         for pred_cluster in sorted(unique_pred_labels):
             true_class = cluster_mapping.get(pred_cluster, "No clear mapping")
-            # print(f'    Cluster {pred_cluster} → "{true_class}"')
         
-        # Show cluster sizes and purity
-        # print('\n  Cluster Analysis:')
         for pred_cluster in sorted(unique_pred_labels):
             cluster_mask = self.y_pred == pred_cluster
             cluster_size = np.sum(cluster_mask)
@@ -270,11 +316,7 @@ class PsiloClusterer():
         
     def compute_chance_baselines(self):
         """Compute various chance baselines for clustering evaluation."""
-        # print('\n' + '='*60)
-        # print('CHANCE BASELINES COMPARISON')
-        # print('='*60)
-        
-        # Get the actual number of clusters found by the algorithm
+
         n_pred_clusters = len(np.unique(self.y_pred))
         # print(f'True classes: {self.n_clusters}, Predicted clusters: {n_pred_clusters}')
         
@@ -313,17 +355,7 @@ class PsiloClusterer():
         print(f'Permutation Baseline:')
         print(f'  ARI: {ari_permuted:.3f}')
         print(f'  NMI: {nmi_permuted:.3f}')
-        
-        # 5. Theoretical Random Baseline
-        # For ARI: expected value is 0 for random clustering
-        # For NMI: expected value is 0 for random clustering
-        expected_ari = 0.0
-        expected_nmi = 0.0
-        
-        # print(f'Theoretical Random Baseline:')
-        # print(f'  Expected ARI: {expected_ari:.3f}')
-        # print(f'  Expected NMI: {expected_nmi:.3f}')
-        
+
         # 6. Random with True Number of Clusters
         y_random_true = np.random.randint(0, self.n_clusters, size=len(self.y_true))
         ari_random_true = adjusted_rand_score(self.y_true, y_random_true)
@@ -365,35 +397,29 @@ class PsiloClusterer():
         
     def plot_clustering_results(self):
         """Plot clustering results in 2D PCA space."""
-        # Project to 2D for visualization
         pca_2d = PCA(n_components=2)
         X_2d = pca_2d.fit_transform(self.X)
         
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
         
-        # Convert string labels to numeric for plotting
         unique_true_labels = np.unique(self.y_true)
         true_label_to_num = {label: i for i, label in enumerate(unique_true_labels)}
         y_true_num = np.array([true_label_to_num[label] for label in self.y_true])
         
-        # True labels
         scatter1 = ax1.scatter(X_2d[:, 0], X_2d[:, 1], c=y_true_num, cmap='tab10', alpha=0.7)
         ax1.set_title(f'True {self.label_type} Labels')
         ax1.set_xlabel(f'PC1 ({pca_2d.explained_variance_ratio_[0]:.1%} variance)')
         ax1.set_ylabel(f'PC2 ({pca_2d.explained_variance_ratio_[1]:.1%} variance)')
         
-        # Create custom colorbar labels
         cbar1 = plt.colorbar(scatter1, ax=ax1)
         cbar1.set_ticks(range(len(unique_true_labels)))
         cbar1.set_ticklabels(unique_true_labels)
         
-        # Predicted clusters
         scatter2 = ax2.scatter(X_2d[:, 0], X_2d[:, 1], c=self.y_pred, cmap='tab10', alpha=0.7)
         ax2.set_title(f'{self.clustering_method.upper()} Clustering Results')
         ax2.set_xlabel(f'PC1 ({pca_2d.explained_variance_ratio_[0]:.1%} variance)')
         ax2.set_ylabel(f'PC2 ({pca_2d.explained_variance_ratio_[1]:.1%} variance)')
         
-        # Create custom colorbar labels for predicted clusters
         unique_pred_labels = np.unique(self.y_pred)
         cbar2 = plt.colorbar(scatter2, ax=ax2)
         cbar2.set_ticks(range(len(unique_pred_labels)))
@@ -507,7 +533,21 @@ if __name__ == "__main__":
                                  'copenhagen', 'imperial1', 'imperial2', 'jh_classical', 'jh_overtone', 'most'],
                         default='all',
                         help='Select the playlist you want to analyze.')
+    parser.add_argument('-clip', 
+                        dest='clip',
+                        action='store_true',
+                        default=False,
+                        help='Clip the data of return phase.')
+    parser.add_argument('-boundaries', 
+                        dest='boundaries',
+                        action='store_true',
+                        default=False,
+                        help='Remove ')                        
     args = parser.parse_args()
+
+    if args.boundaries and args.clip:
+        print('Cannot clip and remove boundaries at the same time!')
+        exit()
 
     mean_str = '_mean' if args.mean else ''
 
@@ -517,4 +557,6 @@ if __name__ == "__main__":
                         clustering_method=args.method,
                         plot_flag=args.plot, 
                         playlist=args.playlist,
-                        label_type=args.label)   
+                        label_type=args.label,
+                        clip=args.clip,
+                        boundaries=args.boundaries)   
