@@ -1,3 +1,7 @@
+"""Unsupervised clustering of phase or playlist from acoustic features (kmeans / gmm / agglomerative).
+
+Run: python cluster.py -label [phase/playlist] -method [kmeans/gmm/agglomerative] [-mean] [-plot]
+"""
 import argparse
 import pandas as pd
 import numpy as np
@@ -5,7 +9,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.mixture import GaussianMixture
-from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
+from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score, adjusted_mutual_info_score
 from sklearn.metrics import homogeneity_score, completeness_score, v_measure_score
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
 from sklearn.preprocessing import StandardScaler
@@ -20,9 +24,8 @@ warnings.filterwarnings('ignore', category=ConvergenceWarning)
 warnings.filterwarnings('ignore', message='invalid value encountered in matmul') 
 warnings.filterwarnings('ignore', message='divide by zero encountered in matmul')
 warnings.filterwarnings('ignore', message='overflow encountered in matmul') 
-warnings.filterwarnings('ignore', message='invalid value encountered in divide') 
+warnings.filterwarnings('ignore', message='invalid value encountered in divide')
 
-import pdb
 
 class PsiloClusterer():
     def __init__(self, algo, mean, clustering_method, plot_flag, playlist, label_type, clip=False, boundaries=False):
@@ -198,12 +201,14 @@ class PsiloClusterer():
         # External clustering metrics (compare with true labels)
         ari = adjusted_rand_score(self.y_true, self.y_pred)
         nmi = normalized_mutual_info_score(self.y_true, self.y_pred)
+        ami = adjusted_mutual_info_score(self.y_true, self.y_pred)
         homogeneity = homogeneity_score(self.y_true, self.y_pred)
         completeness = completeness_score(self.y_true, self.y_pred)
         v_measure = v_measure_score(self.y_true, self.y_pred)
         
         print(f'Adjusted Rand Index: {ari:.3f}')
         print(f'Normalized Mutual Information: {nmi:.3f}')
+        print(f'Adjusted Mutual Information: {ami:.3f}')
         print(f'Homogeneity: {homogeneity:.3f}')
         print(f'Completeness: {completeness:.3f}')
         print(f'V-measure: {v_measure:.3f}')
@@ -237,6 +242,7 @@ class PsiloClusterer():
             'silhouette': silhouette_avg,
             'ari': ari,
             'nmi': nmi,
+            'ami': ami,
             'homogeneity': homogeneity,
             'completeness': completeness,
             'v_measure': v_measure

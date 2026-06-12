@@ -1,3 +1,7 @@
+"""Extract acoustic features (openSMILE) from playlist audio files.
+
+Run: python process_data.py --n-processes 10
+"""
 import soundfile as sf
 import glob
 import pandas as pd
@@ -9,18 +13,10 @@ from scipy.signal import resample_poly
 import gc
 import multiprocessing as mp
 from functools import partial
-# import torch
-# import objgraph
 
 import opensmile
-# from maest import get_maest
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
-# import psutil
-
-
-
-import pdb
 
 # from Music2Emotion.music2emo import Music2emo
 # music2emo = Music2emo()
@@ -54,7 +50,6 @@ def process_compare_lld(fn, out_fn, smile_obj):
         embeddings.append(this_emb.mean(axis=0))
 
         gc.collect()
-        # print(f"Memory usage after: {psutil.Process().memory_info().rss / (1024 ** 2)} MB")
 
     # Combine embeddings
     embeddings = np.vstack(embeddings)

@@ -1,3 +1,7 @@
+"""Classify playlist or phase using Spotify audio features.
+
+Run: python spoti_clf.py -clf [playlist/phase]
+"""
 import os
 import pandas as pd
 import numpy as np
@@ -16,10 +20,9 @@ import matplotlib.pyplot as plt
 from collections import Counter
 from scipy.stats import ttest_rel
 
-import pdb
-
-def classify(df, clf, cv):
-    seed = np.random.seed(1987)
+def classify(df, clf, cv, plot_flag, save_svg=False):
+    seed = 1987
+    np.random.seed(seed)
     feature_columns = [col for col in df.columns if col not in 
                         ['#', 'Song', 'Artist', 'Time', 'Genres', 'Parent Genres', 'Album',
                         'Album Date', 'Added At', 'Spotify Track Id', 'Album Label', 'Camelot',
@@ -83,56 +86,94 @@ def classify(df, clf, cv):
     y_pred_all = np.array(y_pred_all)
     y_score_all = np.array(y_score_all)
 
-    plot_roc_auc(y_true_all, y_score_all)
-    compare_with_chance(model, y_true_all, y_pred_all, model_accs_per_fold, baseline_accs_per_fold)
+    if plot_flag:
+        plot_roc_auc(y_true_all, y_score_all, class_names=model.classes_)
+    confmat_path = os.path.join('svgs', 'spoti_clf_confmat.svg') if save_svg else None
+    compare_with_chance(model, y_true_all, y_pred_all, model_accs_per_fold, baseline_accs_per_fold, plot_flag=plot_flag, save_path=confmat_path)
 
 
-def plot_roc_auc(y_true, y_score):
+def plot_roc_auc(
+    y_true,
+    y_score,
+    class_names=None,
+    axis_labelsize=18,
+    tick_labelsize=14,
+    legend_fontsize=14,
+    title_fontsize=18,
+    curve_labelsize=13,
+):
     y_bin = label_binarize(y_true, classes=np.unique(y_true))
     n_classes = y_bin.shape[1]
+
+    if class_names is None:
+        class_names = [str(c) for c in np.unique(y_true)]
+
     plt.figure(figsize=(8, 6))
-    
+    auc_info = []
+
     for i in range(n_classes):
         fpr, tpr, _ = roc_curve(y_bin[:, i], y_score[:, i])
         roc_auc = auc(fpr, tpr)
-        plt.plot(fpr, tpr, label=f'Class {i} (AUC = {roc_auc:.2f})')
-    
+        auc_info.append((roc_auc, fpr, tpr, class_names[i] if i < len(class_names) else f"Class {i}"))
+
+    # Sort by descending AUC for clearer legend ordering
+    auc_info.sort(reverse=True, key=lambda x: x[0])
+
+    for roc_auc, fpr, tpr, name in auc_info:
+        plt.plot(fpr, tpr, label=f'{name} (AUC = {roc_auc:.2f})', linewidth=2)
+
     plt.plot([0, 1], [0, 1], 'k--')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('ROC Curve')
-    plt.legend()
+    plt.xlabel('False Positive Rate', fontsize=axis_labelsize)
+    plt.ylabel('True Positive Rate', fontsize=axis_labelsize)
+    plt.title('ROC Curve', fontsize=title_fontsize)
+    plt.legend(title="Classes", loc='lower right', fontsize=legend_fontsize, title_fontsize=legend_fontsize)
+    plt.xticks(fontsize=tick_labelsize)
+    plt.yticks(fontsize=tick_labelsize)
+
+    ax = plt.gca()
+    legend = ax.get_legend()
+    if legend is not None:
+        for text in legend.get_texts():
+            text.set_fontsize(curve_labelsize)
+
+    plt.tight_layout()
     plt.show()
     
 
-def compare_with_chance(model, y_true, y_pred, model_accs_per_fold=None, baseline_accs_per_fold=None):
+def compare_with_chance(model, y_true, y_pred, model_accs_per_fold=None, baseline_accs_per_fold=None, plot_flag=True, save_path=None):
     cm = confusion_matrix(y_true, y_pred, labels=model.classes_)
     cm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
     cm = np.round(cm, 1)
 
-    fig, ax = plt.subplots(figsize=(5, 5))
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=model.classes_)
-    disp.plot(
-        ax=ax,
-        xticks_rotation=90,
-        cmap='Blues',  
-        include_values=True,     
-        colorbar=False,
-    )
+    if plot_flag:
+        fig, ax = plt.subplots(figsize=(5, 5))
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=model.classes_)
+        disp.plot(
+            ax=ax,
+            xticks_rotation=90,
+            cmap='Blues',  
+            include_values=True,     
+            colorbar=False,
+        )
 
-    plt.xticks(fontsize=6)
-    plt.yticks(fontsize=6)
-    for i in range(len(model.classes_)):
-        for j in range(len(model.classes_)):
-            text = disp.text_[i, j]
-            text.set_fontsize(6)
-            if i == j:
-                text.set_weight('bold')  
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)
+        for i in range(len(model.classes_)):
+            for j in range(len(model.classes_)):
+                text = disp.text_[i, j]
+                text.set_fontsize(14)
+                if i == j:
+                    text.set_weight('bold')  
 
-    ax.tick_params(axis='both', which='major', labelsize=8)
+        ax.tick_params(axis='both', which='major', labelsize=14)
+        ax.set_xlabel('Predicted label', fontsize=15)
+        ax.set_ylabel('True label', fontsize=15)
 
-    plt.tight_layout()
-    plt.show()
+        plt.tight_layout()
+        if save_path:
+            os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+            plt.savefig(save_path, bbox_inches='tight', dpi=300)
+        plt.show()
     majority_class = Counter(y_true).most_common(1)[0][0]
     y_chance_pred = np.full_like(y_true, majority_class)
 
@@ -144,9 +185,6 @@ def compare_with_chance(model, y_true, y_pred, model_accs_per_fold=None, baselin
 
     print("Model Classification Report:")
     print(classification_report(y_true, y_pred))
-
-    # print("Baseline (Chance) Classification Report:")
-    # print(classification_report(y_true, y_chance_pred))
 
     # Perform paired t-test with cross-validation
     if model_accs_per_fold is not None and baseline_accs_per_fold is not None:
@@ -202,6 +240,11 @@ if __name__ == '__main__':
                         choices=[5, 10],
                         default=5,
                         help='Select a number of cross-validation splits')
+    parser.add_argument('-plot', 
+                        dest='plot',
+                        action='store_true',
+                        default=False,
+                        help='Select to create plots.')
     args = parser.parse_args()
     playlists = ['chacruna_baldwin', 'chacruna_kelan_thomas2', 'compass_v2',
                  'copenhagen', 'imperial1', 'imperial2', 'jh_classical', 'jh_overtone']
@@ -209,4 +252,4 @@ if __name__ == '__main__':
     df = pd.read_csv('data/full_data.csv')
     df = df[df['process?'] == True].copy()
 
-    classify(df, args.clf, args.cv)
+    classify(df, args.clf, args.cv, args.plot)

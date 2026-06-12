@@ -1,3 +1,7 @@
+"""Compare Music2Emo and Spotify affective features and generate the comparison plots.
+
+Run: python emotion_comparison.py
+"""
 import glob
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -9,8 +13,6 @@ import numpy as np
 import re
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import colorsys
-
-import pdb
 
 
 
@@ -62,7 +64,7 @@ def get_emotions():
     return emo_df
 
 
-def plot_arousal_valence_compact(df, emo_df, color='playlist'):
+def plot_arousal_valence_compact(df, emo_df, color='playlist', save_svg=False):
 
     all_categories = df[color].unique()
     playlists = all_categories
@@ -119,7 +121,11 @@ def plot_arousal_valence_compact(df, emo_df, color='playlist'):
                             prop={'size': 11, 'family': 'Courier New'})  
     legend.get_title().set_fontsize(13)  
     
-    plt.savefig(f'figs/playlists_AV_{color}.pdf', bbox_inches='tight', dpi=300)
+    if save_svg:
+        os.makedirs('svgs', exist_ok=True)
+        plt.savefig(f'svgs/playlists_AV_{color}.svg', bbox_inches='tight', dpi=300)
+    else:
+        plt.savefig(f'figs/playlists_AV_{color}.pdf', bbox_inches='tight', dpi=300)
     plt.close()
 
 def normalize_dfs(df, emo_df):

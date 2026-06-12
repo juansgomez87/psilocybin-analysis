@@ -5,6 +5,11 @@ music2emo.py
 figs/
 interactive_visualizer.py
 interactive_psilocybin_visualizer.html
+svgs/
+affective_trajectories.py
+classifier_results_table.py
+playlist_plots.py
+save_plots_to_svg.py
 
 MAEST/
 Music2Emotion/

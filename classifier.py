@@ -1,4 +1,9 @@
+"""Supervised classification of phase or playlist from acoustic features (logistic regression / random forest).
+
+Run: python classifier.py -clf [phase/playlist] -reg [log/rf] [-mean] [-plot]
+"""
 import argparse
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,7 +11,7 @@ import seaborn as sns
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, roc_curve, auc, accuracy_score
+from sklearn.metrics import classification_report, roc_curve, auc, accuracy_score, f1_score
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from sklearn.preprocessing import StandardScaler
@@ -26,12 +31,11 @@ warnings.filterwarnings('ignore', category=ConvergenceWarning)
 warnings.filterwarnings('ignore', message='invalid value encountered in matmul') 
 warnings.filterwarnings('ignore', message='divide by zero encountered in matmul')
 warnings.filterwarnings('ignore', message='overflow encountered in matmul') 
-warnings.filterwarnings('ignore', message='invalid value encountered in divide') 
+warnings.filterwarnings('ignore', message='invalid value encountered in divide')
 
-import pdb
 
 class PsiloClassifier():
-    def __init__(self, clf, algo, mean, cv, plot_flag, playlist, reg, resample_method=None, clip=False, boundaries=False, do_pca=False):
+    def __init__(self, clf, algo, mean, cv, plot_flag, playlist, reg, resample_method=None, clip=False, boundaries=False, do_pca=False, return_metrics=False, save_svg=False):
         self.seed = 1987
         np.random.seed(self.seed)
         random.seed(self.seed)
@@ -45,6 +49,13 @@ class PsiloClassifier():
         self.resample_method = resample_method
         self.clip = clip
         self.boundaries = boundaries
+        self.return_metrics = return_metrics
+        self.save_svg = save_svg
+        self.results = None
+        self._fig_dir = "svgs" if save_svg else "figs"
+        self._fig_ext = ".svg" if save_svg else ".pdf"
+        if save_svg:
+            os.makedirs(self._fig_dir, exist_ok=True)
 
         if self.clf == 'phase' and self.boundaries:
             # always find songs at the boundaries of each phase for whole songs
@@ -197,16 +208,19 @@ class PsiloClassifier():
         
         model_accs_per_fold = []
         baseline_accs_per_fold = []
+        macro_f1_per_fold = []
         for train_idx, test_idx in skf.split(self.X, self.y, groups=self.df['file'].values):
             X_train, X_test = self.X[train_idx], self.X[test_idx]
             y_train, y_test = self.y[train_idx], self.y[test_idx]
             
             # Apply resampling to training data only if specified
             if self.resample_method:
-                print(f"Original training class distribution: {Counter(y_train)}")
+                if not self.return_metrics:
+                    print(f"Original training class distribution: {Counter(y_train)}")
                 X_train, y_train, class_weight_dict = self._resample_fold(X_train, y_train)
-                print(f"Resampled training class distribution: {Counter(y_train)}")
-                print(f"Test class distribution: {Counter(y_test)}")
+                if not self.return_metrics:
+                    print(f"Resampled training class distribution: {Counter(y_train)}")
+                    print(f"Test class distribution: {Counter(y_test)}")
                 # Update model with fold-specific class weights
                 if self.reg == 'log':
                     self.model.set_params(class_weight=class_weight_dict)
@@ -229,6 +243,7 @@ class PsiloClassifier():
             y_pred = self.model.predict(X_test)
             model_acc = accuracy_score(y_test, y_pred)
             model_accs_per_fold.append(model_acc)
+            macro_f1_per_fold.append(f1_score(y_test, y_pred, average='macro', zero_division=0))
             y_score = self.model.predict_proba(X_test)
             
             # Calculate baseline accuracy per fold (majority class from training data)
@@ -246,7 +261,28 @@ class PsiloClassifier():
         y_pred_all = np.array(y_pred_all)
         y_score_all = np.array(y_score_all)
         
-        # self.evaluate(y_true_all, y_pred_all, y_score_all)
+        if self.return_metrics:
+            model_accs = np.array(model_accs_per_fold)
+            baseline_accs = np.array(baseline_accs_per_fold)
+            macro_f1 = np.array(macro_f1_per_fold)
+            t_stat, p_value = ttest_rel(model_accs, baseline_accs)
+            cm = confusion_matrix(y_true_all, y_pred_all, labels=self.model.classes_)
+            cm_norm = cm.astype('float') / np.maximum(cm.sum(axis=1, keepdims=True), 1)
+            cm_norm = np.round(cm_norm, 2)
+            self.results = {
+                'accuracy_mean': float(model_accs.mean()),
+                'accuracy_std': float(model_accs.std()),
+                'baseline_accuracy_mean': float(baseline_accs.mean()),
+                'baseline_accuracy_std': float(baseline_accs.std()),
+                'macro_f1_mean': float(macro_f1.mean()),
+                'macro_f1_std': float(macro_f1.std()),
+                't': float(t_stat),
+                'p': float(p_value),
+                'confusion_matrix': cm_norm,
+                'classes': list(self.model.classes_),
+            }
+            return
+
         self.plot_stratified_splits()
         self.plot_roc_auc(y_true_all, y_score_all, self.model.classes_)
         self.compare_with_chance(y_true_all, y_pred_all, model_accs_per_fold, baseline_accs_per_fold)
@@ -271,7 +307,7 @@ class PsiloClassifier():
                 title += f' (Resampling: {self.resample_method})'
             plt.title(title)
             plt.tight_layout()
-            plt.savefig(f'figs/{args.clf}_{self.algo}_{self.reg}_class_dist.pdf')
+            plt.savefig(f'{self._fig_dir}/{self.clf}_{self.algo}_{self.reg}_class_dist{self._fig_ext}')
             plt.show()
         
 
@@ -309,7 +345,7 @@ class PsiloClassifier():
         ax = plt.gca()
         for text in ax.get_legend().get_texts():
             text.set_fontsize(curve_labelsize)
-        plt.savefig(f'figs/{args.clf}_{self.algo}_{self.reg}_roc.pdf')
+        plt.savefig(f'{self._fig_dir}/{self.clf}_{self.algo}_{self.reg}_roc{self._fig_ext}')
         plt.show()
 
 
@@ -327,31 +363,40 @@ class PsiloClassifier():
         if self.plot_flag:
             fig, ax = plt.subplots(figsize=(5, 5))
             disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=self.model.classes_)
-            disp.plot(
-                ax=ax,
-                xticks_rotation=90,
-                cmap='Blues',  
-                include_values=True,     
-                colorbar=False,
-            )
+            if self.clf != 'playlist':
+                disp.plot(
+                    ax=ax,
+                    xticks_rotation=90,
+                    cmap='Blues',  
+                    include_values=True,     
+                    colorbar=False,
+                )
+            else:
+                disp.plot(
+                    ax=ax,
+                    xticks_rotation=90,
+                    cmap='Blues',  
+                    include_values=False,     
+                    colorbar=True,
+                )  
 
             plt.xticks(fontsize=14)
             plt.yticks(fontsize=14)
-            for i in range(len(self.model.classes_)):
-                for j in range(len(self.model.classes_)):
-                    text = disp.text_[i, j]
-                    text.set_fontsize(14)
-                    if i == j:
-                        text.set_weight('bold')  # bold diagonal
-                        # text.set_color('black') 
-            # for text in disp.text_.ravel():
-            #     text.set_fontsize(4)
+            if self.clf != 'playlist':
+                for i in range(len(self.model.classes_)):
+                    for j in range(len(self.model.classes_)):
+                        text = disp.text_[i, j]
+                        text.set_fontsize(14)
+                        if i == j:
+                            text.set_weight('bold')  # bold diagonal
+                            # text.set_color('black') 
+
 
             ax.tick_params(axis='both', which='major', labelsize=14)
             ax.set_xlabel('Predicted label', fontsize=15)
             ax.set_ylabel('True label', fontsize=15)
             plt.tight_layout()
-            plt.savefig(f'figs/{args.clf}_{self.algo}_{self.reg}_confmat.pdf')
+            plt.savefig(f'{self._fig_dir}/{self.clf}_{self.algo}_{self.reg}_confmat{self._fig_ext}')
             plt.show()
 
         # Majority class baseline
@@ -367,9 +412,6 @@ class PsiloClassifier():
 
         print("Model Classification Report:")
         print(classification_report(y_true, y_pred))
-
-        # print("Baseline (Chance) Classification Report:")
-        # print(classification_report(y_true, y_chance_pred))
 
         # Perform paired t-test with cross-validation
         if model_accs_per_fold is not None and baseline_accs_per_fold is not None:
@@ -460,7 +502,7 @@ class PsiloClassifier():
                     axes[i].set_title(f"Feature Importance for '{class_label}'")
 
                 plt.tight_layout()
-                plt.savefig(f'figs/{args.clf}_{self.algo}_{self.reg}_feats_importance.pdf')
+                plt.savefig(f'{self._fig_dir}/{self.clf}_{self.algo}_{self.reg}_feats_importance{self._fig_ext}')
                 plt.show()
 
     def explain_with_shap(self):
@@ -470,6 +512,7 @@ class PsiloClassifier():
 
         explainer = shap.Explainer(self.model, self.X, feature_names=self.feature_columns)
         shap_values = explainer(self.X) 
+
         if isinstance(shap_values, list) or len(shap_values.shape) == 3:
             # Multiclass case: loop through classes
             n_classes = len(self.model.classes_)
@@ -479,6 +522,7 @@ class PsiloClassifier():
                 plt.figure()
 
                 for i, class_label in enumerate(self.model.classes_):
+
                     # print(f"Generating beeswarm for class '{class_label}'...")
                     ax = plt.subplot(n_classes, 1, i + 1)
                     shap.plots.beeswarm(
@@ -487,8 +531,9 @@ class PsiloClassifier():
                         show=False,
                         alpha=0.5,
                         plot_size=(8, 6),
-                        color_bar=False  # Disable colorbar (right y-axis)
+                        color_bar=False,  # Disable colorbar (right y-axis)
                         # plot_size=(6, 4.5)
+                        # order=variance_order
                     )
                     ax.set_xlabel(f"SHAP values for '{class_label}'", fontsize=10)
         
@@ -501,7 +546,7 @@ class PsiloClassifier():
 
 
                 plt.tight_layout()
-                plt.savefig(f'figs/{args.clf}_{self.algo}_{self.reg}_shap.pdf')
+                plt.savefig(f'{self._fig_dir}/{self.clf}_{self.algo}_{self.reg}_shap{self._fig_ext}')
                 plt.show()
 
         else:

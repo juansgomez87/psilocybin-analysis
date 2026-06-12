@@ -1,8 +1,11 @@
+"""Compute statistics on acoustic features (one-way ANOVA across phases), using features every 30s.
+
+Run: python stats.py -clf [playlist/phase]
+"""
 import pandas as pd
 import numpy as np
 import argparse
 import os
-import pdb
 
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -13,9 +16,14 @@ from wordcloud import WordCloud
 import colorsys
 
 class PsiloStats():
-    def __init__(self, algo, mean, group):
+    def __init__(self, algo, mean, group, save_svg=False):
         self.seed = 1987
         self.group = group
+        self.save_svg = save_svg
+        self._fig_dir = "svgs" if save_svg else "figs"
+        self._fig_ext = ".svg" if save_svg else ".pdf"
+        if save_svg:
+            os.makedirs(self._fig_dir, exist_ok=True)
         self.df = pd.read_csv(f'data/df_{algo}{mean}.csv', index_col=0)
 
         self.feats = [col for col in self.df.columns if col not in 
@@ -39,6 +47,17 @@ class PsiloStats():
         playlists = ['chacruna_baldwin', 'chacruna_kelan_thomas2', 'compass_v2',
                     'copenhagen', 'imperial1', 'imperial2', 'jh_classical', 'jh_overtone']
 
+        playlist_display_titles = {
+            'chacruna_baldwin': 'Chacruna Baldwin',
+            'chacruna_kelan_thomas2': 'Chacruna Kelan Thomas 2',
+            'compass_v2': 'Compass v2',
+            'copenhagen': 'Copenhagen',
+            'imperial1': 'Imperial 1',
+            'imperial2': 'Imperial 2',
+            'jh_classical': 'JH Classical',
+            'jh_overtone': 'JH Overtone',
+        }
+
         this_df = pd.read_csv('data/full_data.csv', index_col=0)
         n_colors = len(playlists)
         colors = [colorsys.hsv_to_rgb(i/n_colors, 0.8, 0.8) for i in range(n_colors)]
@@ -57,25 +76,24 @@ class PsiloStats():
             fill_value=0          
         )
         pivot_perc = pivot.div(pivot.sum(axis=1), axis=0) * 100
+        print(pivot)
+
+        phase_order = ['onset', 'peak', 'return']
+        phase_colors = {
+            'onset': '#8B1A1A',
+            'peak': '#8FBC8F',
+            'return': '#1F4E79',
+        }
+        pivot = pivot.reindex(columns=phase_order)
+        pivot = pivot.rename(index=playlist_display_titles)
 
         fig, ax = plt.subplots(1, 1, figsize=(8, 2.5))
-
-        plot = pivot.plot(
-            kind="barh",           
+        pivot.plot(
+            kind="barh",
             stacked=True,
             ax=ax,
-            colormap="Set2"
+            color=[phase_colors[p] for p in pivot.columns],
         )
-        patches = ax.patches
-        n_phases = len(pivot.columns)
-        for i, playlist in enumerate(pivot.index):
-            base_color = mcolors.hex2color(playlist_colors[playlist])
-            for j, phase in enumerate(pivot.columns):
-                patch_idx = i * n_phases + j
-                if patch_idx < len(patches):
-                    shade_factor = 0.6 + (j / n_phases) * 0.4
-                    shaded_color = tuple(c * shade_factor for c in base_color)
-                    patches[patch_idx].set_facecolor(shaded_color)
 
         ax.set_xlabel("Absolute Duration (m)", fontsize=8) 
         ax.set_ylabel("Playlist", fontsize=8)
@@ -83,7 +101,7 @@ class PsiloStats():
         ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=7)
 
         plt.tight_layout()
-        plt.savefig('figs/phase_distribution.pdf', bbox_inches='tight', dpi=300)
+        plt.savefig('figs/figure_s2.eps', bbox_inches='tight', dpi=300)
         plt.close()
 
         numerical_features = ['BPM', 'Dance', 'Energy', 'Acoustic', 'Instrumental', 
@@ -144,10 +162,10 @@ class PsiloStats():
             ax = plt.subplot(grid[idx // n_cols, idx % n_cols])
             ax.imshow(wordcloud, interpolation='bilinear')
             ax.axis('off')
-            playlist_escaped = playlist.replace('_', r'\_')
-            ax.set_title(f"$\\bf{{{playlist_escaped}}}$\n({len(genres)} unique genres)", pad=10, fontsize=16)
+            title = playlist_display_titles.get(playlist, playlist.replace('_', ' ').title())
+            ax.set_title(f"{title}\n({len(genres)} unique genres)", pad=10, fontsize=16)
         
-        plt.savefig('figs/genre_wordcloud_individual.pdf', bbox_inches='tight', dpi=300)
+        plt.savefig('figs/figure_s1.eps', bbox_inches='tight', dpi=300)
         plt.close()
 
         print("\nANOVA Test Results:")
@@ -197,11 +215,58 @@ class PsiloStats():
         plt.savefig('figs/spoti_radar_subplots.pdf', bbox_inches='tight', dpi=300)
         plt.close()
 
+        # 6.1. Create radar plot for phase characteristics
+        phase_means = this_df.groupby('phase')[numerical_features].mean()
+        phase_means_normalized = (phase_means - phase_means.min()) / (phase_means.max() - phase_means.min())
+        phase_means_normalized = phase_means.copy()
+        for col in ['Loud (Db)', 'BPM']:
+            phase_means_normalized[col] = (phase_means[col] - phase_means[col].min()) / (phase_means[col].max() - phase_means[col].min())
+
+        angles = np.linspace(0, 2*np.pi, len(numerical_features), endpoint=False)
+        angles = np.concatenate((angles, [angles[0]]))
+
+        phases = list(phase_means_normalized.index)
+        n_phases = len(phases)
+        n_cols = min(4, n_phases)
+        n_rows = (n_phases + n_cols - 1) // n_cols
+
+        # Use a consistent palette for phases
+        phase_palette = sns.color_palette("Set2", n_phases)
+        phase_colors = dict(zip(phases, phase_palette))
+
+        fig = plt.figure(figsize=(20, 4*n_rows))
+
+        for idx, phase in enumerate(phases, 1):
+            ax = plt.subplot(n_rows, n_cols, idx, projection='polar')
+
+            values = phase_means_normalized.loc[phase].values
+            values = np.concatenate((values, [values[0]]))
+
+            ax.plot(angles, values, 'o-', linewidth=2, color=phase_colors[phase])
+            ax.fill(angles, values, alpha=0.25, color=phase_colors[phase])
+
+            ax.set_xticks(angles[:-1])
+            ax.set_xticklabels(numerical_features, fontsize=14)
+            ax.set_ylim(0, 1)
+
+            phase_escaped = str(phase).replace('_', r'\_')
+            ax.set_title(f"$\\bf{{{phase_escaped}}}$", pad=20, fontsize=16)
+            plt.setp(ax.get_xticklabels(), rotation=45, fontsize=13)
+
+            ax.set_rticks([0.2, 0.4, 0.6, 0.8])
+            ax.grid(True)
+
+        plt.tight_layout()
+        plt.savefig(f'{self._fig_dir}/spoti_radar_phases{self._fig_ext}', bbox_inches='tight', dpi=300)
+        plt.close()
+
         # 7. Analyze playlist statistics and shared songs
         songs_per_playlist = this_df.groupby('playlist').size()
         print("\nNumber of songs per playlist:")
         print(songs_per_playlist)
         total_duration = this_df.groupby('playlist')['Duration (s)'].sum() / 3600  # convert to hours
+        print("\nTotal duration per playlist:")
+        print(total_duration)
 
         fig = plt.figure(figsize=(8, 4))
 
